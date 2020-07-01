@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'TimeService'
+Parameters:
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: '192.168.0.0/16'
+  PublicSubnetCIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 192.168.1.0/24
+  PrivateSubnetCIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 192.168.2.0/24
+  AMI:
+    Description: AMI ID
+    Type: String
+    Default: ami-0089b31e09ac3fffc
+  InstanceType:
+    Description: Application EC2 instance type
+    Type: String
+    Default: t2.micro
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: timeservice
+
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnetCIDR
+      MapPublicIpOnLaunch: true
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PrivateSubnetCIDR
+      MapPublicIpOnLaunch: true
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  EndpointS3:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      RouteTableIds:
+      - !Ref PrivateRouteTable
+      - !Ref PublicRouteTable
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcId: !Ref VPC
+
+  TimeServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - 'ec2.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      RoleName: 'TimeServiceRole'
+
+  TimeServiceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      InstanceProfileName: TimeServiceProfile
+      Path: "/"
+      Roles:
+        - !Ref TimeServiceRole
+
+  ASGConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      KeyName: timeservice
+      AssociatePublicIpAddress: false
+      IamInstanceProfile: !Ref TimeServiceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdf
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 5
+            Encrypted: true
+      ImageId: !Ref AMI
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref WebSG
+      UserData:
+        Fn::Base64: !Sub |
+         #!/usr/bin/env bash
+         sudo amazon-linux-extras install -y nginx1
+         sudo yum install -y php-fpm
+         cat << EOF >> /etc/nginx/default.d/php.conf
+         index index.php index.html index.htm;
+ 
+         location ~ \.(php|phar)(/.*)?$ {
+         fastcgi_split_path_info ^(.+\.(?:php|phar))(/.*)$;
+ 
+         fastcgi_intercept_errors on;
+         fastcgi_index  index.php;
+         include        fastcgi_params;
+         fastcgi_param  SCRIPT_FILENAME  \$document_root\$fastcgi_script_name;
+         fastcgi_param  PATH_INFO \$fastcgi_path_info;
+         fastcgi_pass   localhost:9000;}
+         EOF
+
+         sed -i 's/apache/nginx/g' /etc/php-fpm.d/www.conf
+         mkdir -p /usr/share/nginx/html/now
+         cat << EOF >> /usr/share/nginx/html/now/index.php
+         <?php
+         echo date("Y-m-d H:i:s O");
+         EOF
+
+         sudo systemctl enable php-fpm
+         sudo systemctl enable nginx
+         sudo systemctl start nginx
+         sudo systemctl start php-fpm
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchConfigurationName: !Ref ASGConfig
+      AutoScalingGroupName: TimeServiceASG
+      AvailabilityZones:
+        - eu-west-2a
+      DesiredCapacity: 1
+      MaxSize: 1
+      MinSize: 1
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet
+      LoadBalancerNames: 
+        - !Ref ElasticLoadBalancer
+
+  WebSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Web SG
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          SourceSecurityGroupId: !Ref ElbSG
+
+  ElbSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: ELB SG
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+
+  ElasticLoadBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      LoadBalancerName: timeservice01-elb
+      SecurityGroups:
+        - Ref: ElbSG
+      Subnets: 
+        - !Ref PublicSubnet
+      Scheme: internet-facing
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '80'
+          InstanceProtocol: HTTP
+          Protocol: HTTP
+      AccessLoggingPolicy:
+        EmitInterval: '60'
+        Enabled: 'False'
+        S3BucketName: timeservice-elb-logs
+        S3BucketPrefix: ELB
+      HealthCheck:
+        Target: TCP:80
+        HealthyThreshold: '2'
+        UnhealthyThreshold: '10'
+        Interval: '10'
+        Timeout: '5'
+      ConnectionDrainingPolicy:
+        Enabled: true
+        Timeout: '60'
+Outputs:
+  ElbDNS:
+    Description: ELB DNS
+    Value:
+      'Fn::GetAtt':
+        - ElasticLoadBalancer
+        - DNSName
